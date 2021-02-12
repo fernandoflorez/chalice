@@ -1084,125 +1084,6 @@ class _HandlerRegistration(object):
             self.routes[path][method] = entry
 
 
-class Chalice(_HandlerRegistration, DecoratorAPI):
-    FORMAT_STRING = '%(name)s - %(levelname)s - %(message)s'
-
-    def __init__(self, app_name, debug=False, configure_logs=True, env=None):
-        super(Chalice, self).__init__()
-        self.app_name = app_name
-        self.websocket_api = WebsocketAPI()
-        self.current_request = None
-        self.lambda_context = None
-        self._debug = debug
-        self.configure_logs = configure_logs
-        self.log = logging.getLogger(self.app_name)
-        if env is None:
-            env = os.environ
-        self._initialize(env)
-        self.experimental_feature_flags = set()
-        # This is marked as internal but is intended to be used by
-        # any code within Chalice.
-        self._features_used = set()
-
-    def _initialize(self, env):
-        if self.configure_logs:
-            self._configure_logging()
-        env['AWS_EXECUTION_ENV'] = '%s aws-chalice/%s' % (
-            env.get('AWS_EXECUTION_ENV', 'AWS_Lambda'),
-            __version__,
-        )
-
-    @property
-    def debug(self):
-        return self._debug
-
-    @debug.setter
-    def debug(self, value):
-        self._debug = value
-        self._configure_log_level()
-
-    def _configure_logging(self):
-        if self._already_configured(self.log):
-            return
-        handler = logging.StreamHandler(sys.stdout)
-        # Timestamp is handled by lambda itself so the
-        # default FORMAT_STRING doesn't need to include it.
-        formatter = logging.Formatter(self.FORMAT_STRING)
-        handler.setFormatter(formatter)
-        self.log.propagate = False
-        self._configure_log_level()
-        self.log.addHandler(handler)
-
-    def _already_configured(self, log):
-        if not log.handlers:
-            return False
-        for handler in log.handlers:
-            if isinstance(handler, logging.StreamHandler):
-                if handler.stream == sys.stdout:
-                    return True
-        return False
-
-    def _configure_log_level(self):
-        if self._debug:
-            level = logging.DEBUG
-        else:
-            level = logging.ERROR
-        self.log.setLevel(level)
-
-    def register_blueprint(self, blueprint, name_prefix=None, url_prefix=None):
-        blueprint.register(self, options={'name_prefix': name_prefix,
-                                          'url_prefix': url_prefix})
-
-    def _register_handler(self, handler_type, name, user_handler,
-                          wrapped_handler, kwargs, options=None):
-        self._do_register_handler(handler_type, name, user_handler,
-                                  wrapped_handler, kwargs, options)
-
-    # These are defined here on the Chalice class because we want all the
-    # feature flag tracking to live in Chalice and not the DecoratorAPI.
-    def _register_on_ws_connect(self, name, user_handler, handler_string,
-                                kwargs, **unused):
-        self._features_used.add('WEBSOCKETS')
-        super(Chalice, self)._register_on_ws_connect(
-            name, user_handler, handler_string, kwargs, **unused)
-
-    def _register_on_ws_message(self, name, user_handler, handler_string,
-                                kwargs, **unused):
-        self._features_used.add('WEBSOCKETS')
-        super(Chalice, self)._register_on_ws_message(
-            name, user_handler, handler_string, kwargs, **unused)
-
-    def _register_on_ws_disconnect(self, name, user_handler,
-                                   handler_string, kwargs, **unused):
-        self._features_used.add('WEBSOCKETS')
-        super(Chalice, self)._register_on_ws_disconnect(
-            name, user_handler, handler_string, kwargs, **unused)
-
-    def _get_middleware_handlers(self, event_type):
-        # We're returning a generator here because we want to defer the
-        # collection of all middleware until as last as possible (when
-        # then handler is actually invoked).  This lets us pick up any
-        # middleware that's registered after a handler has been defined,
-        # which is the behavior you'd expect.
-        return (func for func, filter_type in self.middleware_handlers if
-                filter_type in [event_type, 'all'])
-
-    def __call__(self, event, context):
-        # For legacy reasons, we can't move the Rest API handler entry
-        # point away from this Chalice.__call__ method . However, we can
-        # try to extract as much as logic as possible to a separate handler
-        # class we can call.  That way it's still structured somewhat similar
-        # to the other event handlers which makes it more manageable to
-        # implement shared functionality (e.g. middleware).
-        self.lambda_context = context
-        handler = RestAPIEventHandler(
-            self.routes, self.api, self.log, self.debug,
-            middleware_handlers=self._get_middleware_handlers('http'),
-        )
-        self.current_request = handler.create_request_object(event, context)
-        return handler(event, context)
-
-
 class BuiltinAuthConfig(object):
     def __init__(self, name, handler_string, ttl_seconds=None,
                  execution_role=None, header='Authorization'):
@@ -1739,6 +1620,127 @@ class RestAPIEventHandler(BaseLambdaHandler):
         for name, value in cors_headers.items():
             if name not in response.headers:
                 response.headers[name] = value
+
+
+class Chalice(_HandlerRegistration, DecoratorAPI):
+    FORMAT_STRING = '%(name)s - %(levelname)s - %(message)s'
+
+    def __init__(self, app_name, debug=False, configure_logs=True, env=None,
+                 request_class=RestAPIEventHandler):
+        super(Chalice, self).__init__()
+        self.app_name = app_name
+        self.websocket_api = WebsocketAPI()
+        self.current_request = None
+        self.lambda_context = None
+        self._debug = debug
+        self.configure_logs = configure_logs
+        self.log = logging.getLogger(self.app_name)
+        if env is None:
+            env = os.environ
+        self._request_class = request_class
+        self._initialize(env)
+        self.experimental_feature_flags = set()
+        # This is marked as internal but is intended to be used by
+        # any code within Chalice.
+        self._features_used = set()
+
+    def _initialize(self, env):
+        if self.configure_logs:
+            self._configure_logging()
+        env['AWS_EXECUTION_ENV'] = '%s aws-chalice/%s' % (
+            env.get('AWS_EXECUTION_ENV', 'AWS_Lambda'),
+            __version__,
+        )
+
+    @property
+    def debug(self):
+        return self._debug
+
+    @debug.setter
+    def debug(self, value):
+        self._debug = value
+        self._configure_log_level()
+
+    def _configure_logging(self):
+        if self._already_configured(self.log):
+            return
+        handler = logging.StreamHandler(sys.stdout)
+        # Timestamp is handled by lambda itself so the
+        # default FORMAT_STRING doesn't need to include it.
+        formatter = logging.Formatter(self.FORMAT_STRING)
+        handler.setFormatter(formatter)
+        self.log.propagate = False
+        self._configure_log_level()
+        self.log.addHandler(handler)
+
+    def _already_configured(self, log):
+        if not log.handlers:
+            return False
+        for handler in log.handlers:
+            if isinstance(handler, logging.StreamHandler):
+                if handler.stream == sys.stdout:
+                    return True
+        return False
+
+    def _configure_log_level(self):
+        if self._debug:
+            level = logging.DEBUG
+        else:
+            level = logging.ERROR
+        self.log.setLevel(level)
+
+    def register_blueprint(self, blueprint, name_prefix=None, url_prefix=None):
+        blueprint.register(self, options={'name_prefix': name_prefix,
+                                          'url_prefix': url_prefix})
+
+    def _register_handler(self, handler_type, name, user_handler,
+                          wrapped_handler, kwargs, options=None):
+        self._do_register_handler(handler_type, name, user_handler,
+                                  wrapped_handler, kwargs, options)
+
+    # These are defined here on the Chalice class because we want all the
+    # feature flag tracking to live in Chalice and not the DecoratorAPI.
+    def _register_on_ws_connect(self, name, user_handler, handler_string,
+                                kwargs, **unused):
+        self._features_used.add('WEBSOCKETS')
+        super(Chalice, self)._register_on_ws_connect(
+            name, user_handler, handler_string, kwargs, **unused)
+
+    def _register_on_ws_message(self, name, user_handler, handler_string,
+                                kwargs, **unused):
+        self._features_used.add('WEBSOCKETS')
+        super(Chalice, self)._register_on_ws_message(
+            name, user_handler, handler_string, kwargs, **unused)
+
+    def _register_on_ws_disconnect(self, name, user_handler,
+                                   handler_string, kwargs, **unused):
+        self._features_used.add('WEBSOCKETS')
+        super(Chalice, self)._register_on_ws_disconnect(
+            name, user_handler, handler_string, kwargs, **unused)
+
+    def _get_middleware_handlers(self, event_type):
+        # We're returning a generator here because we want to defer the
+        # collection of all middleware until as last as possible (when
+        # then handler is actually invoked).  This lets us pick up any
+        # middleware that's registered after a handler has been defined,
+        # which is the behavior you'd expect.
+        return (func for func, filter_type in self.middleware_handlers if
+                filter_type in [event_type, 'all'])
+
+    def __call__(self, event, context):
+        # For legacy reasons, we can't move the Rest API handler entry
+        # point away from this Chalice.__call__ method . However, we can
+        # try to extract as much as logic as possible to a separate handler
+        # class we can call.  That way it's still structured somewhat similar
+        # to the other event handlers which makes it more manageable to
+        # implement shared functionality (e.g. middleware).
+        self.lambda_context = context
+        handler = self._request_class(
+            self.routes, self.api, self.log, self.debug,
+            middleware_handlers=self._get_middleware_handlers('http'),
+        )
+        self.current_request = handler.create_request_object(event, context)
+        return handler(event, context)
 
 
 # These classes contain all the event types that are passed
